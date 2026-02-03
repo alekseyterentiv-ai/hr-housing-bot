@@ -1,9 +1,9 @@
-from flask import Flask, request
 import os
 import json
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from flask import Flask, request
 
 app = Flask(__name__)
 
@@ -14,495 +14,349 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
 TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN", "").strip()
-
 SUPERADMIN_IDS = {x.strip() for x in os.environ.get("SUPERADMIN_IDS", "").split(",") if x.strip()}
-ADMIN_IDS = {x.strip() for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
-BRIGADIER_IDS = {x.strip() for x in os.environ.get("BRIGADIER_IDS", "").split(",") if x.strip()}
 
 DB_NAME = os.environ.get("DB_NAME", "").strip()
 DB_USER = os.environ.get("DB_USER", "").strip()
 DB_PASS = os.environ.get("DB_PASS", "").strip()
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME", "").strip()
 
-PORT = int(os.environ.get("PORT", "8080"))
+# Cloud SQL unix socket path:
+# /cloudsql/<PROJECT:REGION:INSTANCE>
+CLOUDSQL_DIR = "/cloudsql"
 
 # =========================
-# SIMPLE KEYBOARD HELPERS
+# Helpers
 # =========================
-def kb(rows):
-    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True}
+def tg(method: str, payload: dict):
+    r = requests.post(f"{TG_API}/{method}", json=payload, timeout=30)
+    return r.json()
 
-def main_menu(role: str):
-    rows = [
-        ["🏢 Подразделения", "👥 Штат сотрудников"],
-        ["🏠 Жильё", "📄 Документы"],
-        ["💸 Переводы", "📊 Отчёты"],
-        ["⚙️ Настройки"],
-    ]
-    return kb(rows)
+def is_superadmin(user_id: int) -> bool:
+    return str(user_id) in SUPERADMIN_IDS
 
-def departments_menu():
-    return kb([
-        ["⚡ Создать 5 объектов", "➕ Добавить подразделение"],
-        ["📋 Список подразделений"],
-        ["⬅️ Назад"]
-    ])
+def db_on() -> bool:
+    return bool(DB_NAME and DB_USER and DB_PASS and INSTANCE_CONNECTION_NAME)
 
-def staff_menu():
-    return kb([
-        ["➕ Добавить сотрудника", "📋 Список по подразделению"],
-        ["🔎 Найти сотрудника"],
-        ["⬅️ Назад"]
-    ])
+def get_conn():
+    """
+    Cloud Run -> Cloud SQL via unix socket.
+    IMPORTANT: In Cloud Run you must add Cloud SQL connection in service settings (Connections)
+    and INSTANCE_CONNECTION_NAME must match.
+    """
+    if not db_on():
+        return None
 
-# =========================
-# STATE (simple FSM)
-# =========================
-USER_STATE = {}  # chat_id(str) -> {"step": "...", "data": {...}}
-
-BOOTSTRAP_DEPARTMENTS = ["Обухово", "Одинцово", "Октябрьский", "Экипаж", "Ярцево"]
-
-# =========================
-# TELEGRAM SEND
-# =========================
-def send_message(chat_id: int, text: str, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
-
-# =========================
-# DB CONNECTION (Cloud SQL via unix socket)
-# DB_HOST НЕ НУЖЕН
-# =========================
-def get_db_conn():
-    if not (DB_NAME and DB_USER and DB_PASS and INSTANCE_CONNECTION_NAME):
-        raise RuntimeError("DB env vars not set")
-
-    # Cloud Run + Cloud SQL (unix socket)
-    host = f"/cloudsql/{INSTANCE_CONNECTION_NAME}"
     return psycopg2.connect(
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
-        host=host,
-        port=5432,
-        connect_timeout=5,
+        host=f"{CLOUDSQL_DIR}/{INSTANCE_CONNECTION_NAME}",
+        cursor_factory=RealDictCursor,
     )
 
-def db_ping() -> bool:
+def sql_exec(query: str, params=None, fetch=False):
+    conn = get_conn()
+    if conn is None:
+        return None
     try:
-        conn = get_db_conn()
-        conn.close()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params or ())
+                if fetch:
+                    return cur.fetchall()
         return True
-    except Exception:
+    finally:
+        conn.close()
+
+def reply_kb_main():
+    # ReplyKeyboard (нижние кнопки)
+    return {
+        "keyboard": [
+            [{"text": "🏢 Подразделения"}, {"text": "👥 Штат сотрудников"}],
+            [{"text": "🏠 Жильё"}, {"text": "📄 Документы"}],
+            [{"text": "🔁 Переводы"}, {"text": "📊 Отчёты"}],
+            [{"text": "⚙️ Настройки"}],
+        ],
+        "resize_keyboard": True
+    }
+
+def safe_text(x):
+    return "" if x is None else str(x)
+
+# =========================
+# DB schema + seed
+# =========================
+SEED_DEPARTMENTS = ["Обухово", "Одинцово", "Октябрьский", "Экипаж", "Ярцево"]
+
+def init_db():
+    if not db_on():
         return False
 
-# =========================
-# ROLE: DB -> fallback env
-# =========================
-def role_from_env(telegram_id: int) -> str:
-    tid = str(telegram_id)
-    if tid in SUPERADMIN_IDS:
-        return "superadmin"
-    if tid in ADMIN_IDS:
-        return "admin"
-    if tid in BRIGADIER_IDS:
-        return "brigadier"
-    return "guest"
+    sql_exec("""
+    CREATE TABLE IF NOT EXISTS departments (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL
+    );
+    """)
 
-def role_from_db(telegram_id: int) -> str | None:
-    conn = get_db_conn()
-    with conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("select role from users where telegram_id = %s limit 1", (telegram_id,))
-            row = cur.fetchone()
-            return row["role"] if row and row.get("role") else None
+    sql_exec("""
+    CREATE TABLE IF NOT EXISTS staff (
+        id SERIAL PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        position TEXT NOT NULL,
+        department_id INT REFERENCES departments(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
 
-def get_role(telegram_id: int) -> tuple[str, bool]:
-    """
-    returns (role, db_on)
-    """
-    try:
-        r = role_from_db(telegram_id)
-        if r:
-            return r, True
-        return role_from_env(telegram_id), True  # db ok, user not found -> env fallback
-    except Exception:
-        return role_from_env(telegram_id), False
+    # seed departments
+    for name in SEED_DEPARTMENTS:
+        sql_exec("INSERT INTO departments(name) VALUES(%s) ON CONFLICT (name) DO NOTHING;", (name,))
 
-# =========================
-# DB TABLES for departments/staff
-# =========================
-def ensure_tables():
-    conn = get_db_conn()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            create table if not exists departments (
-              id bigserial primary key,
-              name text not null,
-              city text,
-              address text,
-              note text,
-              is_active boolean not null default true,
-              created_at timestamptz not null default now()
-            );
-            """)
-            cur.execute("""
-            create unique index if not exists ux_departments_name
-            on departments (lower(name));
-            """)
+    return True
 
-            cur.execute("""
-            create table if not exists employees (
-              id bigserial primary key,
-              fio text not null,
-              phone text,
-              telegram_id bigint,
-              birth_date date,
-              passport text,
-              note text,
-              is_active boolean not null default true,
-              created_at timestamptz not null default now()
-            );
-            """)
-            cur.execute("create index if not exists ix_employees_fio on employees (lower(fio));")
-            cur.execute("create index if not exists ix_employees_telegram on employees (telegram_id);")
+def list_departments():
+    return sql_exec("SELECT id, name FROM departments ORDER BY name;", fetch=True) or []
 
-            cur.execute("""
-            create table if not exists employee_department (
-              id bigserial primary key,
-              employee_id bigint not null references employees(id) on delete cascade,
-              department_id bigint not null references departments(id) on delete restrict,
-              position text,
-              start_date date not null default current_date,
-              end_date date,
-              created_at timestamptz not null default now()
-            );
-            """)
-            cur.execute("create index if not exists ix_empdep_employee on employee_department(employee_id);")
-            cur.execute("create index if not exists ix_empdep_dept on employee_department(department_id);")
+def find_department_id_by_name(dep_name: str):
+    rows = sql_exec("SELECT id FROM departments WHERE lower(name)=lower(%s) LIMIT 1;", (dep_name,), fetch=True) or []
+    return rows[0]["id"] if rows else None
 
-def db_create_department(name: str) -> bool:
-    conn = get_db_conn()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "insert into departments(name) values (%s) on conflict do nothing",
-                (name.strip(),)
-            )
-            return cur.rowcount == 1
-
-def db_bootstrap_departments(names):
-    created = 0
-    for n in names:
-        try:
-            if db_create_department(n):
-                created += 1
-        except Exception:
-            pass
-    return created
-
-def db_list_departments(limit=50):
-    conn = get_db_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            select id, name, is_active
-            from departments
-            where is_active = true
-            order by name asc
-            limit %s
-        """, (limit,))
-        return cur.fetchall()
-
-def db_get_department_by_name(name: str):
-    conn = get_db_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            select id, name
-            from departments
-            where lower(name) = lower(%s) and is_active = true
-            limit 1
-        """, (name.strip(),))
-        return cur.fetchone()
-
-def db_create_employee(fio: str, phone: str, telegram_id: int | None = None) -> int | None:
-    conn = get_db_conn()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                insert into employees(fio, phone, telegram_id)
-                values (%s, %s, %s)
-                returning id
-            """, (fio.strip(), phone.strip(), telegram_id))
-            row = cur.fetchone()
-            return row[0] if row else None
-
-def db_assign_employee_to_department(employee_id: int, department_id: int, position: str | None = None) -> bool:
-    conn = get_db_conn()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                update employee_department
-                set end_date = current_date
-                where employee_id = %s and end_date is null
-            """, (employee_id,))
-            cur.execute("""
-                insert into employee_department(employee_id, department_id, position)
-                values (%s, %s, %s)
-            """, (employee_id, department_id, position))
-            return True
-
-def db_list_staff_by_department(dept_id: int, limit=200):
-    conn = get_db_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            select e.id, e.fio, e.phone
-            from employee_department ed
-            join employees e on e.id = ed.employee_id
-            where ed.department_id = %s and ed.end_date is null and e.is_active = true
-            order by e.fio asc
-            limit %s
-        """, (dept_id, limit))
-        return cur.fetchall()
-
-def db_find_employee(q: str, limit=20):
-    conn = get_db_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            select id, fio, phone
-            from employees
-            where is_active = true
-              and (lower(fio) like lower(%s) or phone like %s)
-            order by fio asc
-            limit %s
-        """, (f"%{q.strip()}%", f"%{q.strip()}%", limit))
-        return cur.fetchall()
+def list_staff(dep_name: str = None):
+    if dep_name:
+        return sql_exec("""
+            SELECT s.id, s.full_name, s.position, d.name AS department
+            FROM staff s
+            LEFT JOIN departments d ON d.id = s.department_id
+            WHERE lower(d.name)=lower(%s)
+            ORDER BY s.id DESC;
+        """, (dep_name,), fetch=True) or []
+    return sql_exec("""
+        SELECT s.id, s.full_name, s.position, d.name AS department
+        FROM staff s
+        LEFT JOIN departments d ON d.id = s.department_id
+        ORDER BY s.id DESC;
+    """, fetch=True) or []
 
 # =========================
-# ROUTES
+# Telegram logic
+# =========================
+def handle_start(chat_id: int):
+    text = (
+        "HR Housing Control ✅\n\n"
+        "Команды:\n"
+        "/start — меню\n"
+        "/whoami — показать chat_id\n\n"
+        "Если доступ не выдан — пришли мне /whoami."
+    )
+    tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_kb_main()
+    })
+
+def handle_whoami(chat_id: int, user_id: int, first_name: str, username: str):
+    role = "superadmin" if is_superadmin(user_id) else "user"
+    text = (
+        f"chat_id: {chat_id}\n"
+        f"user_id: {user_id}\n"
+        f"username: @{safe_text(username)}\n"
+        f"name: {safe_text(first_name)}\n"
+        f"role: {role}\n"
+        f"(db: {'on' if db_on() else 'off'})"
+    )
+    tg("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": reply_kb_main()})
+
+def show_departments(chat_id: int):
+    if not db_on():
+        tg("sendMessage", {"chat_id": chat_id, "text": "База выключена (db: off). Проверь переменные Cloud Run."})
+        return
+
+    deps = list_departments()
+    lines = ["🏢 Подразделения (объекты клиента):"]
+    for d in deps:
+        lines.append(f"- {d['name']} (id={d['id']})")
+
+    lines.append("\nКоманды супер-админа:")
+    lines.append("/dep — список")
+    lines.append("/dep_add <название> — добавить")
+    lines.append("/seed — создать таблицы + добавить 5 объектов")
+    tg("sendMessage", {"chat_id": chat_id, "text": "\n".join(lines), "reply_markup": reply_kb_main()})
+
+def show_staff(chat_id: int):
+    if not db_on():
+        tg("sendMessage", {"chat_id": chat_id, "text": "База выключена (db: off). Проверь переменные Cloud Run."})
+        return
+
+    rows = list_staff()
+    lines = ["👥 Штат сотрудников:"]
+    if not rows:
+        lines.append("Пока пусто.")
+    else:
+        for r in rows[:50]:
+            dep = r["department"] or "—"
+            lines.append(f"#{r['id']} | {r['full_name']} | {r['position']} | {dep}")
+
+    lines.append("\nКоманды супер-админа:")
+    lines.append("/staff — список")
+    lines.append("/staff <подразделение> — список по объекту")
+    lines.append("/staff_add ФИО | должность | подразделение")
+    lines.append("/staff_move <id> | подразделение")
+    lines.append("/staff_del <id>")
+    tg("sendMessage", {"chat_id": chat_id, "text": "\n".join(lines), "reply_markup": reply_kb_main()})
+
+def handle_admin_commands(chat_id: int, user_id: int, text: str):
+    if not is_superadmin(user_id):
+        tg("sendMessage", {"chat_id": chat_id, "text": "Команда доступна только супер-админу."})
+        return
+
+    if text.startswith("/seed"):
+        ok = init_db()
+        tg("sendMessage", {"chat_id": chat_id, "text": "✅ DB init + seed готово" if ok else "❌ DB off / нет доступа"})
+        return
+
+    if text.startswith("/dep_add"):
+        name = text.replace("/dep_add", "", 1).strip()
+        if not name:
+            tg("sendMessage", {"chat_id": chat_id, "text": "Пример: /dep_add Обухово-2"})
+            return
+        sql_exec("INSERT INTO departments(name) VALUES(%s) ON CONFLICT (name) DO NOTHING;", (name,))
+        tg("sendMessage", {"chat_id": chat_id, "text": f"✅ Добавил подразделение: {name}"})
+        return
+
+    if text.startswith("/dep"):
+        show_departments(chat_id)
+        return
+
+    if text.startswith("/staff_add"):
+        # format: /staff_add ФИО | должность | подразделение
+        raw = text.replace("/staff_add", "", 1).strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 3:
+            tg("sendMessage", {"chat_id": chat_id, "text": "Формат: /staff_add Иванов Иван | грузчик | Обухово"})
+            return
+        fio, pos, dep = parts
+        dep_id = find_department_id_by_name(dep)
+        if dep_id is None:
+            tg("sendMessage", {"chat_id": chat_id, "text": f"❌ Не нашёл подразделение '{dep}'. Сначала добавь /dep_add {dep}"})
+            return
+        sql_exec("INSERT INTO staff(full_name, position, department_id) VALUES(%s,%s,%s);", (fio, pos, dep_id))
+        tg("sendMessage", {"chat_id": chat_id, "text": f"✅ Добавил сотрудника: {fio} | {pos} | {dep}"})
+        return
+
+    if text.startswith("/staff_move"):
+        # format: /staff_move <id> | <подразделение>
+        raw = text.replace("/staff_move", "", 1).strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) != 2:
+            tg("sendMessage", {"chat_id": chat_id, "text": "Формат: /staff_move 12 | Одинцово"})
+            return
+        staff_id, dep = parts
+        if not staff_id.isdigit():
+            tg("sendMessage", {"chat_id": chat_id, "text": "ID должен быть числом. Пример: /staff_move 12 | Одинцово"})
+            return
+        dep_id = find_department_id_by_name(dep)
+        if dep_id is None:
+            tg("sendMessage", {"chat_id": chat_id, "text": f"❌ Не нашёл подразделение '{dep}'"})
+            return
+        sql_exec("UPDATE staff SET department_id=%s WHERE id=%s;", (dep_id, int(staff_id)))
+        tg("sendMessage", {"chat_id": chat_id, "text": f"✅ Перевёл сотрудника #{staff_id} в {dep}"})
+        return
+
+    if text.startswith("/staff_del"):
+        sid = text.replace("/staff_del", "", 1).strip()
+        if not sid.isdigit():
+            tg("sendMessage", {"chat_id": chat_id, "text": "Формат: /staff_del 12"})
+            return
+        sql_exec("DELETE FROM staff WHERE id=%s;", (int(sid),))
+        tg("sendMessage", {"chat_id": chat_id, "text": f"✅ Удалил сотрудника #{sid}"})
+        return
+
+    if text.startswith("/staff"):
+        arg = text.replace("/staff", "", 1).strip()
+        if arg:
+            rows = list_staff(arg)
+            lines = [f"👥 Штат — {arg}:"]
+            if not rows:
+                lines.append("Пусто.")
+            else:
+                for r in rows[:50]:
+                    dep = r["department"] or "—"
+                    lines.append(f"#{r['id']} | {r['full_name']} | {r['position']} | {dep}")
+            tg("sendMessage", {"chat_id": chat_id, "text": "\n".join(lines)})
+        else:
+            show_staff(chat_id)
+        return
+
+def handle_text(chat_id: int, user_id: int, txt: str):
+    txt = (txt or "").strip()
+
+    # кнопки
+    if txt == "🏢 Подразделения":
+        show_departments(chat_id)
+        return
+    if txt == "👥 Штат сотрудников":
+        show_staff(chat_id)
+        return
+
+    # команды
+    if txt.startswith("/start"):
+        handle_start(chat_id)
+        return
+    if txt.startswith("/whoami"):
+        # whoami handled in webhook (we need user fields)
+        return
+
+    # админские команды
+    if txt.startswith(("/seed", "/dep", "/dep_add", "/staff", "/staff_add", "/staff_move", "/staff_del")):
+        handle_admin_commands(chat_id, user_id, txt)
+        return
+
+    # заглушка на остальные пункты
+    if txt in ("🏠 Жильё", "📄 Документы", "🔁 Переводы", "📊 Отчёты", "⚙️ Настройки"):
+        tg("sendMessage", {"chat_id": chat_id, "text": f"Принял: {txt}\n(Этот раздел подключим следующим шагом)", "reply_markup": reply_kb_main()})
+        return
+
+    tg("sendMessage", {"chat_id": chat_id, "text": "Не понял. Нажми /start", "reply_markup": reply_kb_main()})
+
+# =========================
+# Webhook + health
 # =========================
 @app.get("/")
-def root():
+def health():
     return "ok", 200
 
-@app.get("/health")
-def health():
-    return {"ok": True, "db": db_ping()}, 200
-
-@app.post("/webhook")
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    # Telegram secret token verification (optional but recommended)
+    # Secret header check (optional)
     if TELEGRAM_SECRET_TOKEN:
         got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if got != TELEGRAM_SECRET_TOKEN:
             return "forbidden", 403
 
     update = request.get_json(silent=True) or {}
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
+    message = update.get("message") or update.get("edited_message")
+
+    if not message:
         return "ok", 200
 
-    chat_id = msg["chat"]["id"]
-    from_user = msg.get("from", {})
-    user_id = from_user.get("id")
-    text = (msg.get("text") or "").strip()
+    chat_id = message["chat"]["id"]
+    user = message.get("from", {})
+    user_id = user.get("id")
+    first_name = user.get("first_name", "")
+    username = user.get("username", "")
 
-    role, db_on = get_role(user_id)
+    text = message.get("text", "")
 
-    # access control
-    if role == "guest":
-        if text in ("/start", "/whoami"):
-            send_message(chat_id, f"chat_id: {chat_id}\nuser_id: {user_id}\nrole: guest\n(db: {'on' if db_on else 'off'})")
-        else:
-            send_message(chat_id, "⛔ Нет доступа. Пришли /whoami и отправь мне chat_id.")
+    if text.strip().startswith("/whoami"):
+        handle_whoami(chat_id, user_id, first_name, username)
         return "ok", 200
 
-    # commands
-    if text == "/start":
-        send_message(chat_id,
-                     "Меню:\n/start — меню\n/whoami — показать chat_id\n\nЕсли доступ не выдан — пришли мне /whoami.",
-                     reply_markup=main_menu(role))
-        return "ok", 200
-
-    if text == "/whoami":
-        username = from_user.get("username", "")
-        name = (from_user.get("first_name", "") + " " + from_user.get("last_name", "")).strip()
-        send_message(chat_id,
-                     f"chat_id: {chat_id}\nuser_id: {user_id}\nusername: @{username}\nname: {name}\nrole: {role}\n(db: {'on' if db_on else 'off'})",
-                     reply_markup=main_menu(role))
-        return "ok", 200
-
-    # ensure tables (only if DB is on)
-    if db_on:
-        try:
-            ensure_tables()
-        except Exception:
-            pass
-
-    cid = str(chat_id)
-    state = USER_STATE.get(cid, {})
-
-    # ---- main sections ----
-    if text == "🏢 Подразделения":
-        send_message(chat_id, "🏢 Подразделения:", reply_markup=departments_menu())
-        return "ok", 200
-
-    if text == "👥 Штат сотрудников":
-        send_message(chat_id, "👥 Штат сотрудников:", reply_markup=staff_menu())
-        return "ok", 200
-
-    if text == "⬅️ Назад":
-        USER_STATE.pop(cid, None)
-        send_message(chat_id, "Главное меню:", reply_markup=main_menu(role))
-        return "ok", 200
-
-    # =========================
-    # DEPARTMENTS
-    # =========================
-    if text == "⚡ Создать 5 объектов":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна. Невозможно создать подразделения.", reply_markup=departments_menu())
-            return "ok", 200
-        created = db_bootstrap_departments(BOOTSTRAP_DEPARTMENTS)
-        send_message(chat_id, f"✅ Готово. Создано новых: {created}", reply_markup=departments_menu())
-        return "ok", 200
-
-    if text == "➕ Добавить подразделение":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна. Невозможно добавить.", reply_markup=departments_menu())
-            return "ok", 200
-        USER_STATE[cid] = {"step": "dept_add_name", "data": {}}
-        send_message(chat_id, "Введи название подразделения (например: Обухово):")
-        return "ok", 200
-
-    if state.get("step") == "dept_add_name":
-        name = text.strip()
-        ok = db_create_department(name)
-        USER_STATE.pop(cid, None)
-        if ok:
-            send_message(chat_id, f"✅ Подразделение добавлено: {name}", reply_markup=departments_menu())
-        else:
-            send_message(chat_id, f"⚠️ Не добавил (возможно уже есть): {name}", reply_markup=departments_menu())
-        return "ok", 200
-
-    if text == "📋 Список подразделений":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна. Невозможно показать список.", reply_markup=departments_menu())
-            return "ok", 200
-        rows = db_list_departments()
-        if not rows:
-            send_message(chat_id, "Пока нет подразделений.", reply_markup=departments_menu())
-            return "ok", 200
-        lines = [f'#{r["id"]} — {r["name"]}' for r in rows]
-        send_message(chat_id, "📋 Подразделения:\n" + "\n".join(lines), reply_markup=departments_menu())
-        return "ok", 200
-
-    # =========================
-    # STAFF
-    # =========================
-    if text == "➕ Добавить сотрудника":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна. Невозможно добавить сотрудника.", reply_markup=staff_menu())
-            return "ok", 200
-        USER_STATE[cid] = {"step": "emp_add_fio", "data": {}}
-        send_message(chat_id, "Введи ФИО сотрудника:")
-        return "ok", 200
-
-    if state.get("step") == "emp_add_fio":
-        fio = text.strip()
-        USER_STATE[cid] = {"step": "emp_add_phone", "data": {"fio": fio}}
-        send_message(chat_id, "Введи телефон (как есть, можно без +):")
-        return "ok", 200
-
-    if state.get("step") == "emp_add_phone":
-        phone = text.strip()
-        fio = state.get("data", {}).get("fio", "")
-        USER_STATE[cid] = {"step": "emp_choose_dept", "data": {"fio": fio, "phone": phone}}
-        deps = db_list_departments()
-        if not deps:
-            send_message(chat_id, "⚠️ Нет подразделений. Сначала создай их в 'Подразделения'.", reply_markup=staff_menu())
-            USER_STATE.pop(cid, None)
-            return "ok", 200
-        buttons = [[d["name"]] for d in deps[:20]]
-        buttons.append(["⬅️ Назад"])
-        send_message(chat_id, "Выбери подразделение:", reply_markup=kb(buttons))
-        return "ok", 200
-
-    if state.get("step") == "emp_choose_dept":
-        dept_name = text.strip()
-        dept = db_get_department_by_name(dept_name)
-        if not dept:
-            send_message(chat_id, "Не понял подразделение. Нажми кнопку из списка.")
-            return "ok", 200
-
-        fio = state.get("data", {}).get("fio", "")
-        phone = state.get("data", {}).get("phone", "")
-        emp_id = db_create_employee(fio=fio, phone=phone, telegram_id=from_user.get("id"))
-        if emp_id:
-            db_assign_employee_to_department(emp_id, dept["id"])
-            send_message(chat_id, f"✅ Сотрудник добавлен:\n{fio}\n{phone}\n→ {dept['name']}", reply_markup=staff_menu())
-        else:
-            send_message(chat_id, "⚠️ Не смог создать сотрудника.", reply_markup=staff_menu())
-        USER_STATE.pop(cid, None)
-        return "ok", 200
-
-    if text == "📋 Список по подразделению":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна.", reply_markup=staff_menu())
-            return "ok", 200
-        USER_STATE[cid] = {"step": "staff_list_choose_dept", "data": {}}
-        deps = db_list_departments()
-        if not deps:
-            send_message(chat_id, "⚠️ Нет подразделений.", reply_markup=staff_menu())
-            USER_STATE.pop(cid, None)
-            return "ok", 200
-        buttons = [[d["name"]] for d in deps[:20]]
-        buttons.append(["⬅️ Назад"])
-        send_message(chat_id, "Выбери подразделение:", reply_markup=kb(buttons))
-        return "ok", 200
-
-    if state.get("step") == "staff_list_choose_dept":
-        dept = db_get_department_by_name(text.strip())
-        if not dept:
-            send_message(chat_id, "Нажми подразделение кнопкой.")
-            return "ok", 200
-        staff = db_list_staff_by_department(dept["id"])
-        USER_STATE.pop(cid, None)
-        if not staff:
-            send_message(chat_id, f"В {dept['name']} пока нет сотрудников.", reply_markup=staff_menu())
-            return "ok", 200
-        lines = [f'#{s["id"]} — {s["fio"]} ({s["phone"] or "-"})' for s in staff]
-        send_message(chat_id, f"👥 {dept['name']}:\n" + "\n".join(lines), reply_markup=staff_menu())
-        return "ok", 200
-
-    if text == "🔎 Найти сотрудника":
-        if not db_on:
-            send_message(chat_id, "⚠️ БД недоступна.", reply_markup=staff_menu())
-            return "ok", 200
-        USER_STATE[cid] = {"step": "emp_find_query", "data": {}}
-        send_message(chat_id, "Введи ФИО или телефон для поиска:")
-        return "ok", 200
-
-    if state.get("step") == "emp_find_query":
-        q = text.strip()
-        rows = db_find_employee(q)
-        USER_STATE.pop(cid, None)
-        if not rows:
-            send_message(chat_id, "Ничего не нашёл.", reply_markup=staff_menu())
-            return "ok", 200
-        lines = [f'#{r["id"]} — {r["fio"]} ({r["phone"] or "-"})' for r in rows]
-        send_message(chat_id, "🔎 Найдено:\n" + "\n".join(lines), reply_markup=staff_menu())
-        return "ok", 200
-
-    # default
-    send_message(chat_id, "Принял: " + text, reply_markup=main_menu(role))
+    handle_text(chat_id, user_id, text)
     return "ok", 200
 
-
+# For local run (optional)
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
